@@ -1,0 +1,245 @@
+---
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Cloudy With A Chance of AWS
+
+Parameters:
+  AllowSSHFrom:
+    Description: Lockdown SSH access to the instance (default can be accessed from anywhere)
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid CIDR range of the form x.x.x.x/x.
+
+  AppInstanceType:
+    Description: App EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarge
+      - hs1.8xlarge
+      - g2.2xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to instance
+    Type: String
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "[a-zA-Z0-9-_]+"
+    ConstraintDescription: must only contain alphanumeric characters, dashes and underscores.
+
+  SnapshotId:
+    Description: An existing snapshot ID
+    Type: String
+
+  VPCId:
+    Description: An existing VPC ID
+    Type: String
+
+  VPCSubnetId:
+    Description: An existing VPC Subnet ID
+    Type: String
+
+Mappings:
+  # Amazon Linux AMI 2014.09.1 (HVM)
+  AWSLinuxAMI:
+    ap-northeast-1:
+      AMI: ami-4985b048
+    ap-southeast-1:
+      AMI: ami-ac5c7afe
+    ap-southeast-2:
+      AMI: ami-63f79559
+    eu-central-1:
+      AMI: ami-b43503a9
+    eu-west-1:
+      AMI: ami-6e7bd919
+    sa-east-1:
+      AMI: ami-8737829a
+    us-east-1:
+      AMI: ami-b66ed3de
+    us-west-1:
+      AMI: ami-4b6f650e
+    us-west-2:
+      AMI: ami-b5a7ea85
+
+Resources:
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: cwacoaws-app
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateImage"
+                  - "ec2:DescribeImages"
+                  - "ec2:ModifyImageAttribute"
+                  - "ec2:ModifySnapshotAttribute"
+                Resource:
+                  - "*"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - Ref: AppRole
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP to App instance
+      VpcId:
+        Ref: VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp:
+            Ref: AllowSSHFrom
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp:
+            Ref: AllowSSHFrom
+      Tags:
+        - Key: Name
+          Value: cwacoaws-app
+
+  App:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType:
+        Ref: AppInstanceType
+      ImageId:
+        Fn::FindInMap:
+          - AWSLinuxAMI
+          - Ref: AWS::Region
+          - AMI
+      KeyName:
+        Ref: KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: 0
+          SubnetId:
+            Ref: VPCSubnetId
+          GroupSet:
+            - Ref: AppSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdb
+          Ebs:
+            SnapshotId:
+              Ref: SnapshotId
+            VolumeSize: 1
+            DeleteOnTermination: true
+      IamInstanceProfile:
+        Ref: AppInstanceProfile
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ""
+            - - "#!/bin/bash\n"
+              - "# Update and upgrade existing packages\n"
+              - "yum update -y\n"
+              - "# Install nginx\n"
+              - "yum install -y nginx\n"
+              - "# Mount EBS volume created from snapshot\n"
+              - "mkdir /mnt/content\n"
+              - "mount /dev/xvdb1 /mnt/content\n"
+              - "# Create directory for web content\n"
+              - "mkdir -p /data/www\n"
+              - "# Copy content\n"
+              - "cp /mnt/content/html/index.html /data/www/index.html\n"
+              - "chown -R nginx:nginx /data/\n"
+              - "# Configure nginx\n"
+              - "echo '\n"
+              - "events {\n"
+              - "  worker_connections 512;\n"
+              - "}\n\n"
+              - "http {\n"
+              - "  server {\n"
+              - "    location / {\n"
+              - "      root /data/www;\n"
+              - "    }\n"
+              - "  }\n"
+              - "}' | tee /etc/nginx/nginx.conf\n"
+              - "# Start nginx on boot\n"
+              - "chkconfig nginx on\n"
+              - "# Get instance ID from metadata\n"
+              - "instance_id=$(curl http://169.254.169.254/latest/meta-data/instance-id)\n"
+              - "# Get AWS region\n"
+              - "echo '"
+              - Ref: AWS::Region
+              - "' > /home/ec2-user/aws_region\n"
+              - "# Create an AMI\n"
+              - "aws_region=$(cat /home/ec2-user/aws_region)\n"
+              - "image_id=$(aws --region \"${aws_region}\" ec2 create-image --name cwacoaws --description cloudy-with-a-chance-of-aws --instance-id \"${instance_id}\" --block-device-mappings \"[{\\\"DeviceName\\\":\\\"/dev/sdb\\\",\\\"NoDevice\\\":\\\"\\\"}]\" --output text > /home/ec2-user/image_id)\n"
+              - "# Create reboot script\n"
+              - "echo '#!/bin/bash\n"
+              - "aws_region=$(cat /home/ec2-user/aws_region)\n"
+              - "image_id=$(cat /home/ec2-user/image_id)\n"
+              - "while state=$(aws --region \"${aws_region}\" ec2 describe-images --image-id \"${image_id}\" --query 'Images[].State[]' --output text); test \"${state}\" = \"pending\"; do\n"
+              - "  sleep 1;\n"
+              - "done;\n"
+              - "snapshot_id=$(aws --region \"${aws_region}\" ec2 describe-images --image-id \"${image_id}\" --query 'Images[].BlockDeviceMappings[].Ebs[].SnapshotId' --output text)\n"
+              - "aws --region \"${aws_region}\" ec2 modify-snapshot-attribute --snapshot-id \"${snapshot_id}\" --attribute createVolumePermission --operation add --group-names all\n"
+              - "aws --region \"${aws_region}\" ec2 modify-image-attribute --image-id \"${image_id}\" --launch-permission \"{\\\"Add\\\":[{\\\"Group\\\":\\\"all\\\"}]}\"\n"
+              - "' > /usr/local/bin/cwacoaws\n"
+              - "# Make script executable\n"
+              - "chmod +x /usr/local/bin/cwacoaws\n"
+              - "# Create reboot cronjob\n"
+              - "echo 'SHELL=/bin/bash\n"
+              - "PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin\n"
+              - "@reboot root cwacoaws' > /etc/cron.d/cwacoaws\n"
+      Tags:
+        - Key: Name
+          Value: cwacoaws-app
+
+Outputs:
+  AppInstanceId:
+    Description: App - Instance ID
+    Value:
+      Ref: App
+
+  AppPublicIP:
+    Description: App - Public IP
+    Value:
+      Fn::GetAtt:
+        - App
+        - PublicIp
